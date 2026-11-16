@@ -30,6 +30,7 @@ gpui-webview = { version = "0.7", features = ["gpui-fast"] }
 - Use `WebView::set_bounds()` and `WebView::set_visible()` to keep the managed container and Wry child synchronized. Raw Wry handles bypass this coordination.
 - Use `WebView::build()` to attach a webview to a GPUI window with the platform setup Wry needs.
 - On Linux, the webview uses WebKitGTK and requires the application to run on X11 (or XWayland in a Wayland session). Start it with `gpui_kit::platform::linux(WindowingModes::X11)`; `WebView::build()` returns an error on a Wayland window. Wayland is not supported.
+- On Linux, `WebView::build()` also drives GTK's main loop from GPUI. It waits on GLib's own file descriptors and timers rather than polling, and only while a web view shows in a visible window. With none showing (hidden, released, or in a minimized window), it stops once WebKit has finished hiding or releasing the view, within 2 seconds, and GTK's events wait, so a page loading out of sight continues once a web view shows again. Calls through `WebView` wake the loop at once; work started through a `WebViewHandle` is dispatched at its next wakeup.
 
 On Windows, or without `gpui-fast`, use the webview in a separate window or a Popup layer when overlapping GPUI content is required.
 

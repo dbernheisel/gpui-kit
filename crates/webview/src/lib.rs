@@ -11,6 +11,9 @@ mod macos;
 use composition::NativeWebViewSurface;
 #[cfg(all(feature = "gpui-fast", target_os = "linux"))]
 use linux::NativeWebViewSurface;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use linux::gtk_pump_rounds;
 
 use std::{cell::Cell, ops::Deref, rc::Rc};
 
@@ -42,6 +45,9 @@ const _: () = {
 /// Cloning this handle prolongs the native webview's lifetime. Dropping the owning [`WebView`]
 /// entity hides the child view, but final native destruction waits until all handle and frame
 /// clones are dropped. All handles must be dropped before the parent window is destroyed.
+///
+/// On Linux, GTK dispatches the work a call through this handle starts at the GTK pump's next
+/// wakeup, and not at all while no web view shows; calls through [`WebView`] wake it at once.
 #[derive(Clone)]
 pub struct WebViewHandle(Rc<wry::WebView>);
 
@@ -76,6 +82,12 @@ pub struct WebView {
     /// The window-relative origin that page clicks are forwarded to GPUI from.
     #[cfg(target_os = "linux")]
     origin: Rc<Cell<gpui::Point<Pixels>>>,
+    /// Keeps the GTK pump running while this view shows in a visible window; `None` when
+    /// GTK's main loop is not driven by [`WebView::build`].
+    #[cfg(target_os = "linux")]
+    pump: Option<Rc<linux::PumpVote>>,
+    #[cfg(target_os = "linux")]
+    _window_visibility: Option<gpui::Subscription>,
 }
 
 impl Drop for WebView {
@@ -107,6 +119,18 @@ impl WebView {
         linux::forward_mouse_down(&webview, origin.clone(), window, cx);
         #[cfg(target_os = "linux")]
         linux::match_scale_factor(&webview, window.scale_factor(), 1.0);
+        #[cfg(target_os = "linux")]
+        let (pump, window_visibility) = match cx.try_global::<linux::GtkPump>() {
+            Some(pump) => {
+                let vote = pump.vote(window.is_visible());
+                let observer = window.observe_window_visibility({
+                    let vote = vote.clone();
+                    move |visibility, _, _| vote.set_window_visible(visibility.is_visible())
+                });
+                (Some(vote), Some(observer))
+            }
+            None => (None, None),
+        };
         #[cfg(not(any(all(feature = "gpui-fast", target_os = "macos"), target_os = "linux")))]
         let _ = window;
 
@@ -125,6 +149,18 @@ impl WebView {
             scale_factor: Cell::new(window.scale_factor()),
             #[cfg(target_os = "linux")]
             origin,
+            #[cfg(target_os = "linux")]
+            pump,
+            #[cfg(target_os = "linux")]
+            _window_visibility: window_visibility,
+        }
+    }
+
+    /// Wake the GTK pump to dispatch what a call into GTK queued.
+    fn nudge_gtk(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(pump) = &self.pump {
+            pump.nudge();
         }
     }
 
@@ -132,7 +168,9 @@ impl WebView {
     ///
     /// On Linux the window must run on X11 or XWayland: start the application with
     /// `gpui_kit::platform::linux(WindowingModes::X11)`. A Wayland window returns an error.
-    /// This also initializes GTK and drives its main loop from GPUI. With the `gpui-fast` feature,
+    /// This also initializes GTK and drives its main loop from GPUI while a web view shows in a
+    /// visible window, without polling; with none showing, GTK's events wait until one shows
+    /// again. With the `gpui-fast` feature,
     /// the webview is built in a window composition surface so GPUI overlays can render above it.
     pub fn build(
         builder: wry::WebViewBuilder,
@@ -166,6 +204,7 @@ impl WebView {
     /// Set window-relative bounds, including offscreen loading bounds.
     /// With window composition, position the managed container and its child together.
     pub fn set_bounds(&self, bounds: Rect) -> wry::Result<()> {
+        self.nudge_gtk();
         #[cfg(all(feature = "gpui-fast", any(target_os = "macos", target_os = "linux")))]
         if let Some(surface) = &self.composition {
             return surface
@@ -226,6 +265,11 @@ impl WebView {
     // Geometry can temporarily hide the native view without changing the caller's
     // visibility preference, so prepaint can retry when the view becomes unclipped.
     fn set_native_visible(&self, visible: bool) -> wry::Result<()> {
+        self.nudge_gtk();
+        #[cfg(target_os = "linux")]
+        if let Some(pump) = &self.pump {
+            pump.set_view_visible(visible);
+        }
         self.webview.set_visible(visible)?;
         #[cfg(all(feature = "gpui-fast", any(target_os = "macos", target_os = "linux")))]
         if let Some(surface) = &self.composition {
@@ -271,16 +315,19 @@ impl WebView {
 
     /// Go back in the webview history.
     pub fn back(&mut self) -> anyhow::Result<()> {
+        self.nudge_gtk();
         Ok(self.webview.evaluate_script("history.back();")?)
     }
 
     /// Go forward in the webview history.
     pub fn forward(&mut self) -> anyhow::Result<()> {
+        self.nudge_gtk();
         Ok(self.webview.evaluate_script("history.forward();")?)
     }
 
     /// Load a URL in the webview.
     pub fn load_url(&mut self, url: &str) {
+        self.nudge_gtk();
         let _ = self.webview.load_url(url);
     }
 
@@ -290,6 +337,7 @@ impl WebView {
     /// On Linux this is GTK's process-wide `gtk-application-prefer-dark-theme`, so it
     /// applies to every webview in the application.
     pub fn set_theme(&self, theme: wry::Theme) -> wry::Result<()> {
+        self.nudge_gtk();
         #[cfg(target_os = "linux")]
         linux::set_theme(theme);
         #[cfg(target_os = "macos")]
@@ -306,6 +354,7 @@ impl WebView {
     /// factor across navigations.
     pub fn set_zoom(&self, zoom: f64) -> wry::Result<()> {
         self.zoom.set(zoom);
+        self.nudge_gtk();
         // WebKitGTK's zoom also makes up for the gap between GPUI's scale factor and
         // GTK's integer one, so the page zoom is applied on top of it.
         #[cfg(target_os = "linux")]
@@ -322,6 +371,7 @@ impl WebView {
 
     /// Get the raw wry webview.
     pub fn raw(&self) -> &wry::WebView {
+        self.nudge_gtk();
         &self.webview
     }
 
@@ -335,6 +385,7 @@ impl Deref for WebView {
     type Target = wry::WebView;
 
     fn deref(&self) -> &Self::Target {
+        self.nudge_gtk();
         &self.webview
     }
 }
@@ -483,10 +534,12 @@ impl Element for WebViewElement {
         let bounds = hitbox.clone().map(|h| h.bounds).unwrap_or(bounds);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let webview = self.view.clone();
-            window.on_mouse_event(move |event: &MouseDownEvent, _, _, _| {
+            let parent = self.parent.clone();
+            window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
                 if !bounds.contains(&event.position) {
                     // Click white space to blur the input focus
                     let _ = webview.focus_parent();
+                    parent.read(cx).nudge_gtk();
                 }
             });
         });

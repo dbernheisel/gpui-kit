@@ -3,28 +3,27 @@
 //! GTK cannot embed into a Wayland surface it does not own, so the GPUI application must
 //! run on X11 (natively or through XWayland).
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+mod pump;
+
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    App, Bounds, Global, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels,
-    PlatformInput, Point, Window, point, px,
+    App, Bounds, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, PlatformInput,
+    Point, Window, point, px,
 };
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::raw_window_handle::{
     HandleError, HasWindowHandle, RawWindowHandle, WindowHandle, XlibWindowHandle,
 };
 
-/// How often pending GTK events are dispatched between GPUI frames.
-const GTK_POLL_INTERVAL: Duration = Duration::from_millis(16);
+#[doc(hidden)]
+pub use pump::rounds as gtk_pump_rounds;
+pub(crate) use pump::{GtkPump, PumpVote};
 
-/// Marks that GTK is initialized and its main loop is driven by GPUI.
-struct GtkMainLoop;
-
-impl Global for GtkMainLoop {}
-
-/// Initialize GTK on the X11 backend once and drive its main loop from GPUI.
+/// Initialize GTK on the X11 backend once and drive its main loop from GPUI while a web view
+/// shows (see [`GtkPump`]).
 pub(crate) fn ensure_gtk(cx: &mut App) -> wry::Result<()> {
-    if cx.has_global::<GtkMainLoop>() {
+    if cx.has_global::<GtkPump>() {
         return Ok(());
     }
 
@@ -34,16 +33,8 @@ pub(crate) fn ensure_gtk(cx: &mut App) -> wry::Result<()> {
         gtk::init().map_err(|error| wry::Error::Io(std::io::Error::other(error)))?;
     }
 
-    cx.set_global(GtkMainLoop);
-    cx.spawn(async move |cx| {
-        loop {
-            while gtk::events_pending() {
-                gtk::main_iteration_do(false);
-            }
-            cx.background_executor().timer(GTK_POLL_INTERVAL).await;
-        }
-    })
-    .detach();
+    let pump = GtkPump::start(cx).map_err(wry::Error::Io)?;
+    cx.set_global(pump);
 
     Ok(())
 }
@@ -251,6 +242,10 @@ impl NativeWebViewSurface {
             .clone()
             .spawn(async move |cx| {
                 drop(webview);
+                // Send GTK's requests to destroy the view now: the GTK pump may have stopped.
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.flush();
+                }
                 let result = self.window.update(cx, |_, window, _| {
                     window
                         .enable_window_composition()?
