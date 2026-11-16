@@ -46,15 +46,23 @@ const _: () = {
 /// entity hides the child view, but final native destruction waits until all handle and frame
 /// clones are dropped. All handles must be dropped before the parent window is destroyed.
 ///
-/// On Linux, GTK dispatches the work a call through this handle starts at the GTK pump's next
-/// wakeup, and not at all while no web view shows; calls through [`WebView`] wake it at once.
+/// On Linux, calls through this handle wake the GTK pump as calls through [`WebView`] do; GTK
+/// dispatches nothing while no web view shows.
 #[derive(Clone)]
-pub struct WebViewHandle(Rc<wry::WebView>);
+pub struct WebViewHandle {
+    webview: Rc<wry::WebView>,
+    #[cfg(target_os = "linux")]
+    pump: Option<linux::PumpNudge>,
+}
 
 impl WebViewHandle {
     /// Get the raw wry webview.
     pub fn raw(&self) -> &wry::WebView {
-        &self.0
+        #[cfg(target_os = "linux")]
+        if let Some(pump) = &self.pump {
+            pump.nudge();
+        }
+        &self.webview
     }
 }
 
@@ -377,7 +385,11 @@ impl WebView {
 
     /// Get an owned, UI-thread-local handle to the raw wry webview.
     pub fn handle(&self) -> WebViewHandle {
-        WebViewHandle(self.webview.clone())
+        WebViewHandle {
+            webview: self.webview.clone(),
+            #[cfg(target_os = "linux")]
+            pump: self.pump.as_ref().map(|vote| vote.nudger()),
+        }
     }
 }
 

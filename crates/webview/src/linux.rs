@@ -18,7 +18,7 @@ use wry::raw_window_handle::{
 
 #[doc(hidden)]
 pub use pump::rounds as gtk_pump_rounds;
-pub(crate) use pump::{GtkPump, PumpVote};
+pub(crate) use pump::{GtkPump, PumpNudge, PumpVote};
 
 /// Initialize GTK on the X11 backend once and drive its main loop from GPUI while a web view
 /// shows (see [`GtkPump`]).

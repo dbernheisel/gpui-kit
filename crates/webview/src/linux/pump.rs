@@ -4,10 +4,12 @@
 //! hand. On the main thread, where GTK runs, the pump dispatches what is ready, then asks GLib
 //! what to wait for next: its file descriptors (X11, WebKit's IPC sockets, GLib's own wakeup)
 //! and the time until its next timer. A helper thread waits for those in `g_poll` and wakes the
-//! pump when one is ready. While it waits, the helper owns the context, so GLib wakes it when
-//! any thread adds a source or moves a timer. Calls into GTK from GPUI nudge it as well, since
-//! GTK can queue an event without making a descriptor ready (an X11 event read ahead of a reply,
-//! a synthesized crossing event).
+//! pump when one is ready. The main thread owns the context for the app's life, as `gtk_main`
+//! would, so GLib signals its wakeup descriptor, which the helper polls, whenever another thread
+//! adds a source or moves a timer. GLib doesn't signal for the owner's own sources, so calls
+//! into GTK from GPUI nudge the helper; that also covers events GTK queues without making a
+//! descriptor ready (an X11 event read ahead of a reply, a synthesized crossing event). Sources
+//! the main thread adds while dispatching are seen when the pump asks GLib what to wait for.
 //!
 //! The pump runs only while a web view shows in a visible window. When the last one hides or
 //! is released, it keeps dispatching until GLib goes quiet (WebKit takes a few more turns to
@@ -61,7 +63,10 @@ impl GtkPump {
     /// view shows.
     pub(crate) fn start(cx: &mut App) -> std::io::Result<Self> {
         let context = glib::MainContext::default();
-        let waiter = Waiter::spawn(context.clone())?;
+        // Owned for good: no moment without an owner, when GLib would wake no one for a
+        // source another thread adds.
+        std::mem::forget(context.acquire().map_err(std::io::Error::other)?);
+        let waiter = Waiter::spawn()?;
         let (state, resumed) = PumpState::new(context);
         let pump = state.clone();
         cx.spawn(async move |_| pump.run(waiter, resumed).await)
@@ -72,6 +77,16 @@ impl GtkPump {
     /// A web view's vote, counted while the view and its window are both visible.
     pub(crate) fn vote(&self, window_visible: bool) -> Rc<PumpVote> {
         PumpVote::new(self.0.clone(), window_visible)
+    }
+}
+
+/// Wakes the pump after a call into GTK, without a say in whether it runs.
+#[derive(Clone)]
+pub(crate) struct PumpNudge(Rc<PumpState>);
+
+impl PumpNudge {
+    pub(crate) fn nudge(&self) {
+        self.0.nudge();
     }
 }
 
@@ -108,15 +123,19 @@ impl PumpState {
                     break;
                 }
             }
+            let mut wait = WaitSet::query(&self.context, fds);
 
             if self.showing.get() > 0 {
                 settling = None;
-            } else if quiet || settling.get_or_insert_with(Instant::now).elapsed() >= SETTLE_LIMIT {
+            } else if (quiet && wait.timeout != 0)
+                || settling.get_or_insert_with(Instant::now).elapsed() >= SETTLE_LIMIT
+            {
                 // Send the X11 requests GTK has buffered, such as unmapping the view that just
                 // hid, since nothing flushes them while the pump is stopped.
                 if let Some(display) = gtk::gdk::Display::default() {
                     display.flush();
                 }
+                fds = wait.fds;
                 while self.showing.get() == 0 {
                     if resumed.recv().await.is_err() {
                         return;
@@ -127,15 +146,8 @@ impl PumpState {
                 continue;
             }
 
-            let mut wait = match self.context.acquire() {
-                Ok(_owner) => WaitSet::query(&self.context, fds),
-                Err(error) => {
-                    log::error!("cannot drive GTK's main loop: {error}");
-                    return;
-                }
-            };
-            // While settling, a wait that lasts `SETTLE_QUIET_MS` with nothing ready means GLib
-            // has gone quiet.
+            // While settling, GLib has gone quiet once a wait lasts `SETTLE_QUIET_MS` with
+            // nothing ready, and nothing is ready after the round that follows it.
             let capped = settling.is_some() && (wait.timeout < 0 || wait.timeout > SETTLE_QUIET_MS);
             if capped {
                 wait.timeout = SETTLE_QUIET_MS;
@@ -210,10 +222,15 @@ impl PumpVote {
         self.update();
     }
 
-    /// Wake the pump after calling into GTK, which can queue GTK events without making one of
-    /// GLib's file descriptors ready.
+    /// Wake the pump after calling into GTK, which can add sources or queue GTK events without
+    /// making one of GLib's file descriptors ready.
     pub(crate) fn nudge(&self) {
         self.pump.nudge();
+    }
+
+    /// A nudge for a holder of this web view that has no vote, such as a `WebViewHandle`.
+    pub(crate) fn nudger(&self) -> PumpNudge {
+        PumpNudge(self.pump.clone())
     }
 
     fn update(&self) {
@@ -302,52 +319,36 @@ impl WaitSet {
     }
 }
 
-/// The helper thread that waits on GLib's file descriptors for the pump.
+/// The helper thread that waits on GLib's file descriptors for the pump. It only polls: the
+/// main thread owns the context throughout.
 struct Waiter {
     requests: mpsc::Sender<WaitSet>,
-    owned: mpsc::Receiver<()>,
     done: async_channel::Receiver<WaitSet>,
 }
 
 impl Waiter {
-    fn spawn(context: glib::MainContext) -> std::io::Result<Self> {
+    fn spawn() -> std::io::Result<Self> {
         let (requests, pending) = mpsc::channel::<WaitSet>();
-        let (owner, owned) = mpsc::channel();
         let (finished, done) = async_channel::bounded(1);
         thread::Builder::new()
             .name("gtk-wait".into())
             .spawn(move || {
                 for mut wait in pending {
-                    // Owning the context while waiting makes GLib wake this thread when
-                    // another thread adds a source or moves a timer.
-                    let guard = context.acquire();
-                    if let Err(error) = &guard {
-                        log::warn!("GTK's main context is owned elsewhere: {error}");
-                    }
-                    let _ = owner.send(());
                     // SAFETY: `fds` holds `len` descriptors.
                     wait.ready = unsafe {
                         ffi::g_poll(wait.fds.as_mut_ptr(), wait.fds.len() as u32, wait.timeout)
                     } > 0;
-                    drop(guard);
                     if finished.send_blocking(wait).is_err() {
                         break;
                     }
                 }
             })?;
-        Ok(Self {
-            requests,
-            owned,
-            done,
-        })
+        Ok(Self { requests, done })
     }
 
     /// Wait on the helper thread until something in `wait` is ready, and hand its buffer back.
     async fn wait(&self, wait: WaitSet) -> Option<WaitSet> {
         self.requests.send(wait).ok()?;
-        // Block until the helper owns the context. While no thread owns it, GLib wakes no one
-        // for a source the main thread adds, so the main thread must not run GPUI before then.
-        self.owned.recv().ok()?;
         self.done.recv().await.ok()
     }
 }
@@ -355,17 +356,39 @@ impl Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, atomic::AtomicBool};
 
     /// Run `wait` on the helper as the pump does, without GPUI's executor.
     fn wait_blocking(waiter: &Waiter, wait: WaitSet) -> WaitSet {
         waiter.requests.send(wait).unwrap();
-        waiter.owned.recv().unwrap();
         waiter.done.recv_blocking().unwrap()
     }
 
+    /// Ask GLib what to wait for. The tests that wait hold ownership on the test thread
+    /// throughout, as the main thread does; acquiring again here is recursive.
     fn query(context: &glib::MainContext) -> WaitSet {
         let _owner = context.acquire().unwrap();
         WaitSet::query(context, Vec::new())
+    }
+
+    fn idle_source(fired: &Arc<AtomicBool>) -> glib::Source {
+        let fired = fired.clone();
+        glib::idle_source_new(None, glib::Priority::DEFAULT, move || {
+            fired.store(true, Ordering::SeqCst);
+            glib::ControlFlow::Break
+        })
+    }
+
+    /// Attach an idle source from a worker thread, as GDBus or a GTask returning to the
+    /// default context does.
+    fn attach_from_another_thread(context: &glib::MainContext, fired: &Arc<AtomicBool>) {
+        let context = context.clone();
+        let fired = fired.clone();
+        thread::spawn(move || {
+            idle_source(&fired).attach(Some(&context));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
@@ -380,7 +403,8 @@ mod tests {
     #[test]
     fn waits_until_the_next_timer() {
         let context = glib::MainContext::new();
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _owner = context.acquire().unwrap();
+        let fired = Arc::new(AtomicBool::new(false));
         let source =
             glib::timeout_source_new(Duration::from_millis(100), None, glib::Priority::DEFAULT, {
                 let fired = fired.clone();
@@ -398,7 +422,7 @@ mod tests {
             wait.timeout
         );
 
-        let waiter = Waiter::spawn(context.clone()).unwrap();
+        let waiter = Waiter::spawn().unwrap();
         let started = Instant::now();
         let wait = wait_blocking(&waiter, wait);
         assert!(started.elapsed() >= Duration::from_millis(80));
@@ -408,14 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn a_source_added_while_waiting_wakes_the_helper() {
+    fn a_source_another_thread_adds_while_waiting_wakes_the_helper() {
         let context = glib::MainContext::new();
-        let waiter = Waiter::spawn(context.clone()).unwrap();
+        let _owner = context.acquire().unwrap();
+        let waiter = Waiter::spawn().unwrap();
         let wait = query(&context);
         assert_eq!(wait.timeout, -1);
 
         waiter.requests.send(wait).unwrap();
-        waiter.owned.recv().unwrap();
         // The helper is waiting with no timeout; nothing should come back on its own.
         thread::sleep(Duration::from_millis(200));
         assert!(
@@ -423,35 +447,59 @@ mod tests {
             "the helper woke while idle"
         );
 
-        // An idle source added from this thread, as GTK does from GPUI's calls, touches no
-        // descriptor; GLib wakes the helper because it owns the context.
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let source = glib::idle_source_new(None, glib::Priority::DEFAULT, {
-            let fired = fired.clone();
-            move || {
-                fired.store(true, Ordering::SeqCst);
-                glib::ControlFlow::Break
-            }
-        });
-        source.attach(Some(&context));
+        // An idle source touches no descriptor; GLib signals its wakeup because this thread,
+        // not the one attaching, owns the context.
+        let fired = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        waiter.done.recv_blocking().unwrap();
+        attach_from_another_thread(&context, &fired);
+        let wait = waiter.done.recv_blocking().unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(wait.ready);
         while context.iteration(false) {}
         assert!(fired.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn a_wakeup_returns_from_the_wait() {
+    fn a_source_another_thread_adds_before_the_wait_wakes_the_helper() {
         let context = glib::MainContext::new();
-        let waiter = Waiter::spawn(context.clone()).unwrap();
+        let _owner = context.acquire().unwrap();
+        let waiter = Waiter::spawn().unwrap();
+        let wait = query(&context);
+        assert_eq!(wait.timeout, -1);
+
+        // Between asking GLib what to wait for and the helper's poll.
+        let fired = Arc::new(AtomicBool::new(false));
+        attach_from_another_thread(&context, &fired);
+        waiter.requests.send(wait).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            waiter.done.try_recv().is_ok_and(|wait| wait.ready),
+            "the helper slept through a ready idle source"
+        );
+        while context.iteration(false) {}
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_source_the_owner_adds_waits_for_a_nudge() {
+        let context = glib::MainContext::new();
+        let _owner = context.acquire().unwrap();
+        let waiter = Waiter::spawn().unwrap();
         waiter.requests.send(query(&context)).unwrap();
-        waiter.owned.recv().unwrap();
+
+        // GLib doesn't signal for the owner's own sources, which is why calls into GTK nudge.
+        let fired = Arc::new(AtomicBool::new(false));
+        idle_source(&fired).attach(Some(&context));
+        thread::sleep(Duration::from_millis(200));
+        assert!(waiter.done.try_recv().is_err());
+
         context.wakeup();
         let started = Instant::now();
         let wait = waiter.done.recv_blocking().unwrap();
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(wait.ready, "GLib's wakeup descriptor ends the wait");
+        while context.iteration(false) {}
+        assert!(fired.load(Ordering::SeqCst));
     }
 
     #[test]
