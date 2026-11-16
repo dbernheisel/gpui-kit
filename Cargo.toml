@@ -75,6 +75,7 @@ gpui_web = { package = "gpui-pre-web", version = "=0.3.12" }
 gpui-fast = { package = "gpui-fast", version = "0.1.14", features = ["windows-manifest-provided-by-host"] }
 gpui-fast-platform = { package = "gpui-fast-platform", version = "0.1.14", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-fast-web = { package = "gpui-fast-web", version = "0.1.14" }
+gpui-fast-macros = { package = "gpui-fast-macros", version = "0.1.14" }
 gpui_macros = { package = "gpui-pre-macros", version = "=0.3.12" }
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.12" }
 sum-tree = { package = "gpui-pre-sum-tree", version = "=0.3.12" }

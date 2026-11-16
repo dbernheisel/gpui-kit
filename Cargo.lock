@@ -3799,6 +3799,7 @@ dependencies = [
  "futures",
  "gpui-base",
  "gpui-fast",
+ "gpui-fast-macros",
  "gpui-fast-platform",
  "gpui-pre",
  "gpui-pre-macros",

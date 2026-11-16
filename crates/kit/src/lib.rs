@@ -97,6 +97,9 @@ macro_rules! actions {
 //
 // With test-support, the glob below includes GPUI's test macro. Test modules
 // should import their Kit types explicitly to avoid shadowing Rust's #[test].
+#[cfg(not(any(feature = "gpui-pre", feature = "gpui-fast")))]
+compile_error!("gpui-kit needs a GPUI: enable its `gpui-pre` (default) or `gpui-fast` feature");
+
 #[cfg(not(feature = "gpui-fast"))]
 pub use ::gpui::*;
 #[cfg(feature = "gpui-fast")]

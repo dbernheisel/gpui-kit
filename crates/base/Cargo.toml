@@ -25,10 +25,15 @@ name = "text_view_scroll"
 harness = false
 
 [features]
-gpui-fast = ["dep:gpui-fast"]
+default = ["gpui-pre"]
+# The GPUI snapshot (`gpui-pre`). An application on GPUI Fast alone turns the
+# defaults off and enables `gpui-fast`, so `gpui-pre` is not compiled at all.
+# With both enabled, GPUI Fast is used.
+gpui-pre = ["dep:gpui", "dep:gpui_macros"]
+gpui-fast = ["dep:gpui-fast", "dep:gpui-fast-macros"]
 decimal = ["dep:rust_decimal"]
-test-support = ["gpui/test-support", "gpui-fast?/test-support"]
-inspector = ["gpui_macros/inspector", "gpui/inspector", "gpui-fast?/inspector"]
+test-support = ["gpui?/test-support", "gpui-fast?/test-support"]
+inspector = ["gpui_macros?/inspector", "gpui?/inspector", "gpui-fast?/inspector"]
 
 [dependencies]
 anyhow.workspace = true
@@ -36,9 +41,10 @@ aho-corasick = "1.1.3"
 chrono = "0.4.38"
 data-url = "0.3"
 futures = "0.3"
-gpui.workspace = true
+gpui = { workspace = true, optional = true }
 gpui-fast = { workspace = true, optional = true }
-gpui_macros.workspace = true
+gpui_macros = { workspace = true, optional = true }
+gpui-fast-macros = { workspace = true, optional = true }
 instant.workspace = true
 itertools = "0.13.0"
 lsp-types.workspace = true

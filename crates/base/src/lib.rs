@@ -4,8 +4,14 @@
 //! colors, sizing, and motion belong to applications or the
 //! `gpui-component` façade.
 
+#[cfg(not(any(feature = "gpui-pre", feature = "gpui-fast")))]
+compile_error!("gpui-base needs a GPUI: enable its `gpui-pre` (default) or `gpui-fast` feature");
+
 #[cfg(feature = "gpui-fast")]
 extern crate gpui_fast as gpui;
+// GPUI Fast's own macros, so a build on GPUI Fast alone doesn't need `gpui-pre-macros`.
+#[cfg(feature = "gpui-fast")]
+extern crate gpui_fast_macros as gpui_macros;
 #[cfg(all(feature = "gpui-fast", test))]
 extern crate gpui_fast_platform as gpui_platform;
 
